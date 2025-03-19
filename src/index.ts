@@ -2,6 +2,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import * as http from "http";
 import * as dotenv from "dotenv";
 import { createClient } from "redis";
+const redis = require('redis');
 
 dotenv.config();
 
@@ -10,13 +11,8 @@ const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
 // Redis configuration for Railway
-const redisClient = createClient({
-  socket: {
-    host: process.env.REDIS_HOST || "default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@redis.railway.internal:6379",
-    port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
-    // tls: process.env.REDIS_TLS ? {} : undefined,
-  },
-  password: process.env.REDIS_PASSWORD || undefined,
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || "redis://default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@redis.railway.internal:6379"
 });
 
 // Handle Redis connection events
