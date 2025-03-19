@@ -20,5 +20,8 @@
     "nodemon": "^3.1.9",
     "redis": "^4.7.0",
     "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
   }
 }
