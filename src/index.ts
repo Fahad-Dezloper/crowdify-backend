@@ -17,7 +17,7 @@ const redisClient = redis.createClient({
 
 // Handle Redis connection events
 redisClient.on("connect", () => console.log("✅ Connected to Redis"));
-redisClient.on("error", (err) => console.error("❌ Redis Error:", err));
+redisClient.on("error", (err: any) => console.error("❌ Redis Error:", err));
 
 redisClient.connect().catch(console.error);
 
@@ -61,7 +61,7 @@ wss.on("connection", (ws) => {
 
         try {
           const messages = await redisClient.lRange(`chat:${roomId}`, 0, -1);
-          messages.reverse().forEach((msg) => {
+          messages.reverse().forEach((msg: string) => {
             ws.send(JSON.stringify({ type: "message", ...JSON.parse(msg) }));
           });
         } catch (error) {
@@ -70,7 +70,7 @@ wss.on("connection", (ws) => {
 
         try {
           const songs = await redisClient.lRange(`queue:${roomId}`, 0, -1);
-          const parsedSongs = songs.map((song) => JSON.parse(song));
+          const parsedSongs = songs.map((song: string) => JSON.parse(song));
           ws.send(JSON.stringify({ type: "songQueue", queue: parsedSongs }));
         } catch (error) {
           console.error("Error fetching song queue:", error);
@@ -120,7 +120,7 @@ wss.on("connection", (ws) => {
         }
 
         const songs = await redisClient.lRange(`queue:${roomId}`, 0, -1);
-        const parsedSongs = songs.map((song) => JSON.parse(song));
+        const parsedSongs = songs.map((song: string) => JSON.parse(song));
 
         rooms.get(roomId)?.users.forEach((client) => {
           if (client.readyState === WebSocket.OPEN) {
@@ -151,7 +151,7 @@ wss.on("connection", (ws) => {
           const uniqueSongsMap = new Map();
           
           // First pass - parse all songs and keep only the last occurrence of each songId
-          songs.forEach(songString => {
+          songs.forEach((songString: string) => {
             const song = JSON.parse(songString);
             uniqueSongsMap.set(song.streamId, song);
           });
@@ -251,11 +251,11 @@ wss.on("connection", (ws) => {
             
             // Get all songs from queue
             const songs = await redisClient.lRange(songQueueKey, 0, -1);
-            const parsedSongs = songs.map(song => JSON.parse(song));
+            const parsedSongs = songs.map((song: string) => JSON.parse(song));
             
             if (parsedSongs.length > 0) {
                 // Find song with highest upvotes
-                const mostUpvotedSong = parsedSongs.reduce((prev, curr) => 
+                const mostUpvotedSong = parsedSongs.reduce((prev: { upvoteCount: any; }, curr: { upvoteCount: any; }) => 
                     (prev?.upvoteCount || 0) > (curr?.upvoteCount || 0) ? prev : curr, parsedSongs[0]);
                 
                 if (mostUpvotedSong) {
@@ -263,7 +263,7 @@ wss.on("connection", (ws) => {
                     await redisClient.set(nowPlayingKey, JSON.stringify(mostUpvotedSong));
                     
                     // Remove the song from queue
-                    const updatedQueue = parsedSongs.filter(song => 
+                    const updatedQueue = parsedSongs.filter((song: { streamId: any; }) => 
                         song.streamId !== mostUpvotedSong.streamId);
                     
                     // Update queue in Redis
