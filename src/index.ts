@@ -12,7 +12,7 @@ const wss = new WebSocketServer({ server });
 
 // Redis configuration for Railway
 const redisClient = redis.createClient({
-  url: process.env.REDIS_URL || "redis://default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@redis.railway.internal:6379"
+  url: process.env.REDIS_URL || "redis://default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@tramway.proxy.rlwy.net:15775"
 });
 
 // Handle Redis connection events
