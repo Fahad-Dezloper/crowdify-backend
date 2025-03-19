@@ -9,12 +9,19 @@ const PORT = process.env.WS_PORT || 4000;
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
+// Redis configuration for Railway
 const redisClient = createClient({
   socket: {
-    host: "localhost",
-    port: 6379,
+    host: process.env.REDIS_HOST || "localhost",
+    port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
+    // tls: process.env.REDIS_TLS ? {} : undefined,
   },
+  password: process.env.REDIS_PASSWORD || undefined,
 });
+
+// Handle Redis connection events
+redisClient.on("connect", () => console.log("✅ Connected to Redis"));
+redisClient.on("error", (err) => console.error("❌ Redis Error:", err));
 
 redisClient.connect().catch(console.error);
 
