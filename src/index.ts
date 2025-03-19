@@ -12,7 +12,7 @@ const wss = new WebSocketServer({ server });
 // Redis configuration for Railway
 const redisClient = createClient({
   socket: {
-    host: process.env.REDIS_HOST || "redis://default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@redis.railway.internal:6379",
+    host: process.env.REDIS_HOST || "default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@redis.railway.internal:6379",
     port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
     // tls: process.env.REDIS_TLS ? {} : undefined,
   },
