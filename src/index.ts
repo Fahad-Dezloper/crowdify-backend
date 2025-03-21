@@ -2,197 +2,367 @@ import { WebSocketServer, WebSocket } from "ws";
 import * as http from "http";
 import * as dotenv from "dotenv";
 import { createClient } from "redis";
-const redis = require('redis');
+// For pub/sub between server instances
+import Redis from "ioredis";
 
 dotenv.config();
 
 const PORT = process.env.WS_PORT || 4000;
+const SERVER_ID = process.env.SERVER_ID || `server-${Math.floor(Math.random() * 10000)}`;
+const REDIS_URI = process.env.REDIS_URI || "redis://localhost:6379";
+
+// Create HTTP server and WebSocket server
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
-// Redis configuration for Railway
-const redisClient = redis.createClient({
-  url: process.env.REDIS_URL || "redis://default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@tramway.proxy.rlwy.net:15775"
+// Redis client for data operations
+const redisClient = createClient({
+  socket: {
+    host: "localhost",
+    port: 6379,
+  },
 });
 
-// Handle Redis connection events
-redisClient.on("connect", () => console.log("✅ Connected to Redis"));
-redisClient.on("error", (err: any) => console.error("❌ Redis Error:", err));
+// const PORT = process.env.WS_PORT || 4000;
+// const server = http.createServer();
+// const wss = new WebSocketServer({ server });
 
-redisClient.connect().catch(console.error);
+// const redisClient = createClient({
+//   socket: {
+//     host: "localhost",
+//     port: 6379,
+//   },
+// });
 
-interface Room {
-  users: Set<WebSocket>;
-  chatPaused: boolean;
-  allowSongAdd: boolean; 
+// Dedicated pub/sub clients
+const subscriber = new Redis(REDIS_URI);
+const publisher = new Redis(REDIS_URI);
+
+// Connect to Redis
+async function connectToRedis() {
+  try {
+    await redisClient.connect();
+    console.log("Connected to Redis for data operations");
+    
+    // Subscribe to room events channel
+    subscriber.subscribe("room-events", (err) => {
+      if (err) {
+        console.error("Failed to subscribe to room events:", err);
+        return;
+      }
+      console.log("Subscribed to room events channel");
+    });
+    
+    // Set up message handler for subscriber
+    subscriber.on("message", (channel, message) => {
+      handleRedisMessage(channel, message);
+    });
+    
+  } catch (error) {
+    console.error("Redis connection error:", error);
+    // Retry connection after delay
+    setTimeout(connectToRedis, 5000);
+  }
 }
 
-const rooms = new Map<string, Room>();
+connectToRedis();
 
+// Maps to track connections by room (in-memory for this server only)
+const connectionsByRoom = new Map<string, Set<WebSocket>>();
+const connectionToRoom = new Map<WebSocket, string>();
+
+// Handle messages from Redis pub/sub
+function handleRedisMessage(channel: string, message: string) {
+  if (channel !== "room-events") return;
+  
+  try {
+    const eventData = JSON.parse(message);
+    const { roomId, event, data, source } = eventData;
+    
+    // Ignore events from this server to avoid duplicates
+    if (source === SERVER_ID) return;
+    
+    // Get connections for this room on this server
+    const roomConnections = connectionsByRoom.get(roomId);
+    if (!roomConnections) return;
+    
+    // Broadcast to all connections in the room on this server
+    roomConnections.forEach(conn => {
+      if (conn.readyState === WebSocket.OPEN) {
+        conn.send(JSON.stringify({ type: event, ...data }));
+      }
+    });
+    
+  } catch (error) {
+    console.error("Error handling Redis message:", error);
+  }
+}
+
+// Broadcast to all clients in a room across all server instances
+async function broadcastToRoom(roomId: string, event: string, data: any) {
+  try {
+    // First, broadcast to clients on this server
+    const roomConnections = connectionsByRoom.get(roomId);
+    if (roomConnections) {
+      roomConnections.forEach(conn => {
+        if (conn.readyState === WebSocket.OPEN) {
+          conn.send(JSON.stringify({ type: event, ...data }));
+        }
+      });
+    }
+    
+    // Then publish the event to Redis for other servers
+    await publisher.publish("room-events", JSON.stringify({
+      roomId,
+      event,
+      data,
+      source: SERVER_ID,
+      timestamp: Date.now()
+    }));
+    
+  } catch (error) {
+    console.error(`Error broadcasting to room ${roomId}:`, error);
+  }
+}
+
+// Track active rooms and set expiration
+async function markRoomActive(roomId: string) {
+  try {
+    const key = `room:${roomId}:active`;
+    await redisClient.set(key, "true");
+    
+    // Set room to expire after 24 hours of inactivity
+    await redisClient.expire(key, 24 * 60 * 60); // 24 hours in seconds
+  } catch (error) {
+    console.error(`Error marking room ${roomId} as active:`, error);
+  }
+}
+
+// Cleanup expired rooms (called by scheduled job outside this process)
+async function cleanupRoom(roomId: string) {
+  try {
+    console.log(`Cleaning up inactive room: ${roomId}`);
+    
+    // Get all keys related to this room
+    const roomKeys = await redisClient.keys(`*${roomId}*`);
+    
+    if (roomKeys.length > 0) {
+      await redisClient.del(roomKeys);
+      console.log(`Deleted ${roomKeys.length} keys for room ${roomId}`);
+    }
+    
+  } catch (error) {
+    console.error(`Error cleaning up room ${roomId}:`, error);
+  }
+}
+
+// Handle a new connection joining a room
+async function handleJoinRoom(ws: WebSocket, roomId: string, userId: string) {
+  try {
+    // Update room activity timestamp
+    await markRoomActive(roomId);
+    
+    // Add connection to room tracking
+    if (!connectionsByRoom.has(roomId)) {
+      connectionsByRoom.set(roomId, new Set());
+    }
+    connectionsByRoom.get(roomId)?.add(ws);
+    connectionToRoom.set(ws, roomId);
+    
+    console.log(`User joined room: ${userId} && ${roomId} (server: ${SERVER_ID})`);
+    
+    // Send room state to the new connection
+    await sendRoomState(ws, roomId, userId);
+    
+  } catch (error) {
+    console.error(`Error handling join for room ${roomId}:`, error);
+    ws.send(JSON.stringify({ 
+      type: "error", 
+      message: "Failed to join room. Please try again." 
+    }));
+  }
+}
+
+// Send the current room state to a connection
+async function sendRoomState(ws: WebSocket, roomId: string, userId: string) {
+  try {
+    // Get chat status
+    const chatStatus = await redisClient.get(`chatStatus:${roomId}`);
+    ws.send(JSON.stringify({ 
+      type: "chatStatus", 
+      paused: chatStatus === "paused" 
+    }));
+    
+    // Get song add status
+    const songAddStatus = await redisClient.get(`allowSongAdd:${roomId}`);
+    ws.send(JSON.stringify({ 
+      type: "allowSongAdd", 
+      paused: songAddStatus === "paused" 
+    }));
+    
+    // Get chat history
+    const messages = await redisClient.lRange(`chat:${roomId}`, 0, -1);
+    messages.reverse().forEach((msg) => {
+      ws.send(JSON.stringify({ 
+        type: "message", 
+        ...JSON.parse(msg) 
+      }));
+    });
+    
+    // Get song queue
+    const songs = await redisClient.lRange(`queue:${roomId}`, 0, -1);
+    let parsedSongs = songs.map(song => JSON.parse(song));
+
+    // Check if user has liked each song
+    for (let song of parsedSongs) {
+      const userVoteKey = `vote:${roomId}:${song.streamId}:${userId}`;
+      const userVote = await redisClient.get(userVoteKey);
+      song.hasLiked = userVote === "upvote";
+    }
+
+    ws.send(JSON.stringify({ 
+      type: "songQueue", 
+      queue: parsedSongs 
+    }));
+
+    // Get now playing song
+    const nowPlayingSong = await redisClient.get(`nowPlaying:${roomId}`);
+    if (nowPlayingSong) {
+      ws.send(JSON.stringify({ 
+        type: "nowPlaying", 
+        song: JSON.parse(nowPlayingSong) 
+      }));
+    }
+    
+  } catch (error) {
+    console.error(`Error sending room state for ${roomId}:`, error);
+  }
+}
+
+// WebSocket connection handling
 wss.on("connection", (ws) => {
-  let roomId: string | null = null;
-
+  console.log(`New WebSocket connection on server ${SERVER_ID}`);
+  
   ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message.toString());
-
-      if (data.type === "join") {
-        roomId = data.roomId ?? null;
-
-        if (!roomId) {
-          console.error("Invalid roomId received:", data.roomId);
-          return;
-        }
-
-        if (!rooms.has(roomId)) {
-          rooms.set(roomId, { users: new Set(), chatPaused: false, allowSongAdd: false });
-        }
-
-        rooms.get(roomId)?.users.add(ws);
-        console.log(`User joined room: ${roomId}`);
-
-        const chatPaused = rooms.get(roomId)?.chatPaused || false;
-        console.log("status of chatPaused", chatPaused)
-        ws.send(JSON.stringify({ type: "chatStatus", paused: chatPaused }));
-
-        const allowSongAdd = rooms.get(roomId)?.allowSongAdd || false;
-        console.log("status of chatPaused", allowSongAdd)
-        ws.send(JSON.stringify({ type: "allowSongAdd", paused: allowSongAdd }));
-
-        try {
-          const messages = await redisClient.lRange(`chat:${roomId}`, 0, -1);
-          messages.reverse().forEach((msg: string) => {
-            ws.send(JSON.stringify({ type: "message", ...JSON.parse(msg) }));
-          });
-        } catch (error) {
-          console.error("Error fetching chat history:", error);
-        }
-
-        try {
-          const songs = await redisClient.lRange(`queue:${roomId}`, 0, -1);
-          const parsedSongs = songs.map((song: string) => JSON.parse(song));
-          ws.send(JSON.stringify({ type: "songQueue", queue: parsedSongs }));
-        } catch (error) {
-          console.error("Error fetching song queue:", error);
-        }
-
-        try {
-          const nowPlayingSong = await redisClient.get(`nowPlaying:${roomId}`);
-          if (nowPlayingSong) {
-            ws.send(JSON.stringify({ type: "nowPlaying", song: JSON.parse(nowPlayingSong) }));
-          }
-        } catch (error) {
-          console.error("Error fetching now playing song:", error);
-        }
+      const roomId = data.roomId || connectionToRoom.get(ws);
+      const userId = data.userId
+      
+      if (!roomId && !userId && data.type !== "join") {
+        console.error("No room ID for message:", data);
+        return;
       }
-
-      else if (data.type === "message" && roomId) {
-        const messageData = JSON.stringify({ text: data.text, sender: data.sender });
-        await redisClient.lPush(`chat:${roomId}`, messageData);
-        await redisClient.lTrim(`chat:${roomId}`, 0, 49);
-        const room = rooms.get(roomId);
-
-        if (room?.chatPaused) {
-          ws.send(JSON.stringify({ 
-            type: "chatError", 
-            message: "Chat is currently paused by the room admin"
-          }));
-          return;
-        }
-
-        rooms.get(roomId)?.users.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: "message", text: data.text, sender: data.sender }));
-          }
-        });
-      }
-
-      else if (data.type === "addSong" && roomId) {
-        const song = data.song;
-        // console.log("Song added:", song);
-
-        try {
-          await redisClient.rPush(`queue:${roomId}`, JSON.stringify(song));
-          // console.log(`Song added to Redis queue: ${song.title}`);
+      
+      // Handle different message types
+      switch (data.type) {
+        case "join":
+          console.log("you joined baby", data.userId);
+          await handleJoinRoom(ws, data.roomId, data.userId);
+          break;
           
-        } catch (error) {
-          console.error("Error adding song to Redis:", error);
-        }
-
-        const songs = await redisClient.lRange(`queue:${roomId}`, 0, -1);
-        const parsedSongs = songs.map((song: string) => JSON.parse(song));
-
-        rooms.get(roomId)?.users.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: "addSong", song }));
-            client.send(JSON.stringify({ type: "songQueue", queue: parsedSongs }));
-          }
-        });
-      }
-
-      else if (data.type === "voteUpdate" && roomId) {
-        console.log("Vote update event happeing received:", data);
-        try {
-          if (!data.songId || !data.voteType || !data.userId) {
-            console.error("Error: songId, userId, or voteType is missing in the received data:", data);
+        case "message":
+          // Store message in Redis
+          const messageData = JSON.stringify({ text: data.text, sender: data.sender });
+          await redisClient.lPush(`chat:${roomId}`, messageData);
+          await redisClient.lTrim(`chat:${roomId}`, 0, 49);
+          
+          // Check if chat is paused
+          const chatStatus = await redisClient.get(`chatStatus:${roomId}`);
+          if (chatStatus === "paused") {
+            ws.send(JSON.stringify({ 
+              type: "chatError", 
+              message: "Chat is currently paused by the room admin"
+            }));
             return;
           }
-      
+          
+          // Broadcast to all users in the room across all servers
+          await broadcastToRoom(roomId, "message", { 
+            text: data.text, 
+            sender: data.sender 
+          });
+          
+          // Update room activity
+          await markRoomActive(roomId);
+          break;
+          
+        case "addSong":
+          console.log("event happened for add song");
+          console.log(data);
+          // const songAddStatus = await redisClient.get(`allowSongAdd:${roomId}`);
+          // if (songAddStatus === "paused") {
+          //   ws.send(JSON.stringify({ 
+          //     type: "songError", 
+          //     message: "Adding songs is currently disabled by the room admin"
+          //   }));
+          //   return;
+          // }
+          
+          // Add song to queue
+          await redisClient.rPush(`queue:${roomId}`, JSON.stringify(data.song));
+          
+          // Get updated queue
+          const songs = await redisClient.lRange(`queue:${roomId}`, 0, -1);
+          const parsedSongs = songs.map((song) => JSON.parse(song));
+          
+          // Broadcast updates
+          await broadcastToRoom(roomId, "addSong", { song: data.song });
+          await broadcastToRoom(roomId, "songQueue", { queue: parsedSongs });
+          
+          // Update room activity
+          await markRoomActive(roomId);
+          break;
+          
+        case "voteUpdate":
+          if (!data.songId || !data.voteType || !data.userId) {
+            console.error("Invalid vote data:", data);
+            return;
+          }
+          
           const userVoteKey = `vote:${roomId}:${data.songId}:${data.userId}`;
           const songQueueKey = `queue:${roomId}`;
-      
-          // Fetch user's existing vote status
+          
+          // Process vote
           const existingVote = await redisClient.get(userVoteKey);
-      
-          // Fetch and parse song queue
-          let songs = await redisClient.lRange(songQueueKey, 0, -1);
+          const songsData = await redisClient.lRange(songQueueKey, 0, -1);
           
-          // Create a map to track unique songs by streamId to prevent duplicates
           const uniqueSongsMap = new Map();
-          
-          // First pass - parse all songs and keep only the last occurrence of each songId
-          songs.forEach((songString: string) => {
+          songsData.forEach(songString => {
             const song = JSON.parse(songString);
             uniqueSongsMap.set(song.streamId, song);
           });
           
-          // Convert map back to array
           let parsedQueue = Array.from(uniqueSongsMap.values());
-      
+          
           let updatedQueue = parsedQueue.map(song => {
             if (song.streamId === data.songId) {
               let newUpvoteCount = song.upvoteCount || 0;
-      
-              // If user has already voted this way, they're canceling their vote
+              
               if (existingVote === data.voteType) {
-                // Cancel existing vote
                 newUpvoteCount += (data.voteType === "upvote") ? -1 : 0;
                 redisClient.del(userVoteKey);
               } 
-              // If user is changing their vote (upvote to downvote or vice versa)
               else if (existingVote && existingVote !== data.voteType) {
-                // If changing from downvote to upvote, add 1
                 if (data.voteType === "upvote") {
                   newUpvoteCount += 1;
                 }
-                // If changing from upvote to downvote, subtract 1
                 else {
                   newUpvoteCount = Math.max(newUpvoteCount - 1, 0);
                 }
                 redisClient.set(userVoteKey, data.voteType);
               } 
-              // User hasn't voted before
               else {
                 newUpvoteCount += (data.voteType === "upvote") ? 1 : 0;
                 redisClient.set(userVoteKey, data.voteType);
               }
-      
+              
               return { ...song, upvoteCount: newUpvoteCount };
             }
             return song;
           });
-      
-          // Use a multi/exec transaction to ensure atomic updates
+          
+          // Update queue in Redis
           const multi = redisClient.multi();
           multi.del(songQueueKey);
           
@@ -200,170 +370,153 @@ wss.on("connection", (ws) => {
             multi.rPush(songQueueKey, JSON.stringify(song));
           }
           
-          // Execute all commands atomically
           await multi.exec();
-      
-          // Find highest voted song
-          // let highestVotedSong = updatedQueue.length
-          //   ? updatedQueue.reduce((prev, curr) =>
-          //       (prev?.upvoteCount || 0) > (curr?.upvoteCount || 0) ? prev : curr
-          //     )
-          //   : null;
-      
-          // if (highestVotedSong) {
-          //   await redisClient.set(`nowPlaying:${roomId}`, JSON.stringify(highestVotedSong));
-          // }
-      
-          // Broadcast updated queue and now playing song
-          rooms.get(roomId)?.users.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({ type: "voteUpdate", queue: updatedQueue }));
-              // if (highestVotedSong) {
-              //   client.send(JSON.stringify({ type: "nowPlaying", song: highestVotedSong }));
-              // }
-            }
-          });
-      
-          // console.log("Updated Queue:", updatedQueue);
-          // console.log("New Now Playing:", highestVotedSong);
-        } catch (error) {
-          console.error("Error updating votes:", error);
-        }
-      }
- 
-      else if(data.type === "nextSong" && roomId) {
-        console.log("next song event happen");
-        // console.l/
-
-        try {
-            const songQueueKey = `queue:${roomId}`;
-            const historyKey = `history:${roomId}`;
-            const nowPlayingKey = `nowPlaying:${roomId}`;
-            
-            // Get current song to add to history
-            const currentSongStr = await redisClient.get(nowPlayingKey);
-            if (currentSongStr) {
-                // Add current song to history (push to front)
-                await redisClient.lPush(historyKey, currentSongStr);
-                // Keep only the last 5 songs in history
-                await redisClient.lTrim(historyKey, 0, 4);
-            }
-            
-            // Get all songs from queue
-            const songs = await redisClient.lRange(songQueueKey, 0, -1);
-            const parsedSongs = songs.map((song: string) => JSON.parse(song));
-            
-            if (parsedSongs.length > 0) {
-                // Find song with highest upvotes
-                const mostUpvotedSong = parsedSongs.reduce((prev: { upvoteCount: any; }, curr: { upvoteCount: any; }) => 
-                    (prev?.upvoteCount || 0) > (curr?.upvoteCount || 0) ? prev : curr, parsedSongs[0]);
-                
-                if (mostUpvotedSong) {
-                    // Set as now playing
-                    await redisClient.set(nowPlayingKey, JSON.stringify(mostUpvotedSong));
-                    
-                    // Remove the song from queue
-                    const updatedQueue = parsedSongs.filter((song: { streamId: any; }) => 
-                        song.streamId !== mostUpvotedSong.streamId);
-                    
-                    // Update queue in Redis
-                    const multi = redisClient.multi();
-                    multi.del(songQueueKey);
-                    
-                    for (const song of updatedQueue) {
-                        multi.rPush(songQueueKey, JSON.stringify(song));
-                    }
-                    
-                    await multi.exec();
-                    
-                    // Broadcast updates to all clients
-                    rooms.get(roomId)?.users.forEach((client) => {
-                        if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({ 
-                                type: "nowPlaying", 
-                                song: mostUpvotedSong 
-                            }));
-                            client.send(JSON.stringify({ 
-                                type: "songQueue", 
-                                queue: updatedQueue 
-                            }));
-                        }
-                    });
-                    
-                    console.log(`Next song now playing: ${mostUpvotedSong.title}`);
-                }
-            } else {
-                console.log("No songs in queue");
-            }
-        } catch (error) {
-            console.error("Error handling next song:", error);
-        }
-      }
-
-      else if(data.type === "prevSong" && roomId){
-        console.log("event trigger for previous song")
-      }
-
-      else if (data.type === "chatpause" && roomId) {
-        const room = rooms.get(roomId);
-        if (!room) return;
-        
-        console.log("chat pause", data)
-        console.log("chat pause status", room?.chatPaused)
-        room.chatPaused = !room.chatPaused;
-        
-        await redisClient.set(`chatStatus:${roomId}`, room.chatPaused ? "paused" : "active");
-        
-        room.users.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ 
-              type: "chatStatus",
-              paused: room.chatPaused,
-            }));
+          
+          // Broadcast updates
+          await broadcastToRoom(roomId, "voteUpdate", { queue: updatedQueue });
+          
+          // Update room activity
+          await markRoomActive(roomId);
+          break;
+          
+        case "nextSong":
+          const songQueue = `queue:${roomId}`;
+          const historyKey = `history:${roomId}`;
+          const nowPlayingKey = `nowPlaying:${roomId}`;
+          
+          // Move current song to history
+          const currentSongStr = await redisClient.get(nowPlayingKey);
+          if (currentSongStr) {
+            await redisClient.lPush(historyKey, currentSongStr);
+            await redisClient.lTrim(historyKey, 0, 4);
           }
-        });
-        
-        console.log(`Chat ${room.chatPaused ? "paused" : "resumed"} in room ${roomId}`);
-      }
-
-      else if (data.type === "allowSongAdd" && roomId) {
-        const room = rooms.get(roomId);
-        if (!room) return;
-        
-        console.log("allowSongAdd event", data)
-        console.log("allowSongAdd add status before", room?.allowSongAdd)
-        room.allowSongAdd = !room.allowSongAdd;
-        console.log("allowSongAdd add status after", room?.allowSongAdd)
-        
-        await redisClient.set(`allowSongAdd:${roomId}`, room.allowSongAdd ? "paused" : "active");
-        
-        room.users.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ 
-              type: "allowSongAdd",
-              paused: room.allowSongAdd,
-            }));
+          
+          // Get song queue
+          const queueSongs = await redisClient.lRange(songQueue, 0, -1);
+          const queueParsedSongs = queueSongs.map(song => JSON.parse(song));
+          
+          if (queueParsedSongs.length > 0) {
+            // Find most upvoted song
+            const mostUpvotedSong = queueParsedSongs.reduce((prev, curr) => 
+              (prev?.upvoteCount || 0) > (curr?.upvoteCount || 0) ? prev : curr, queueParsedSongs[0]);
+            
+            // Set as now playing
+            await redisClient.set(nowPlayingKey, JSON.stringify(mostUpvotedSong));
+            
+            // Remove from queue
+            const updatedQueue = queueParsedSongs.filter(song => 
+              song.streamId !== mostUpvotedSong.streamId);
+            
+            // Update queue in Redis
+            const queueMulti = redisClient.multi();
+            queueMulti.del(songQueue);
+            
+            for (const song of updatedQueue) {
+              queueMulti.rPush(songQueue, JSON.stringify(song));
+            }
+            
+            await queueMulti.exec();
+            
+            // Broadcast updates
+            await broadcastToRoom(roomId, "nowPlaying", { song: mostUpvotedSong });
+            await broadcastToRoom(roomId, "songQueue", { queue: updatedQueue });
           }
-        });
-        
-        console.log(`Chat ${room.allowSongAdd ? "paused" : "resumed"} in room ${roomId}`);
+          
+          // Update room activity
+          await markRoomActive(roomId);
+          break;
+          
+        case "chatpause":
+          // Toggle chat pause state
+          const room = await redisClient.get(`chatStatus:${roomId}`);
+          const newChatStatus = room === "paused" ? "active" : "paused";
+          
+          await redisClient.set(`chatStatus:${roomId}`, newChatStatus);
+          
+          // Broadcast update
+          await broadcastToRoom(roomId, "chatStatus", { paused: newChatStatus === "paused" });
+          
+          // Update room activity
+          await markRoomActive(roomId);
+          break;
+          
+        case "allowSongAdd":
+          // Toggle song add state
+          const songAddState = await redisClient.get(`allowSongAdd:${roomId}`);
+          const newSongAddState = songAddState === "paused" ? "active" : "paused";
+          
+          await redisClient.set(`allowSongAdd:${roomId}`, newSongAddState);
+          
+          // Broadcast update
+          await broadcastToRoom(roomId, "allowSongAdd", { paused: newSongAddState === "paused" });
+          
+          // Update room activity
+          await markRoomActive(roomId);
+          break;
+          
+        default:
+          console.log(`Unknown message type: ${data.type}`);
       }
-
+      
     } catch (error) {
-      console.error("Failed to parse incoming message:", error);
+      console.error("Error processing message:", error);
     }
-
   });
-
+  
+  // Handle WebSocket disconnection
   ws.on("close", () => {
-    if (roomId && rooms.has(roomId)) {
-      rooms.get(roomId)?.users.delete(ws);
-      if (rooms.get(roomId)?.users.size === 0) {
-        rooms.delete(roomId);
+    const roomId = connectionToRoom.get(ws);
+    if (roomId) {
+      // Remove connection from tracking
+      connectionToRoom.delete(ws);
+      const roomConnections = connectionsByRoom.get(roomId);
+      
+      if (roomConnections) {
+        roomConnections.delete(ws);
+        
+        if (roomConnections.size === 0) {
+          connectionsByRoom.delete(roomId);
+        }
       }
-      console.log(`User left room: ${roomId}`);
+      
+      console.log(`User left room: ${roomId} (server: ${SERVER_ID})`);
     }
   });
 });
 
-server.listen(PORT, () => console.log(`WebSocket server running on port ${PORT}`));
+// Set up health check endpoint for load balancers
+server.on("request", (req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200);
+    res.end(`OK - Server ${SERVER_ID} is healthy`);
+  }
+});
+
+// Graceful shutdown
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
+
+async function gracefulShutdown() {
+  console.log(`Shutting down server ${SERVER_ID}...`);
+  
+  try {
+    // Close Redis connections
+    await redisClient.quit();
+    await subscriber.quit();
+    await publisher.quit();
+    
+    // Close WebSocket server
+    wss.close();
+    
+    // Close HTTP server
+    server.close();
+    
+    console.log(`Server ${SERVER_ID} shut down gracefully`);
+    process.exit(0);
+  } catch (error) {
+    console.error("Error during shutdown:", error);
+    process.exit(1);
+  }
+}
+
+server.listen(PORT, () => console.log(`WebSocket server ${SERVER_ID} running on port ${PORT}`));
