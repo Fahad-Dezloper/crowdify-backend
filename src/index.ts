@@ -23,17 +23,6 @@ const redisClient = createClient({
   },
 });
 
-// const PORT = process.env.WS_PORT || 4000;
-// const server = http.createServer();
-// const wss = new WebSocketServer({ server });
-
-// const redisClient = createClient({
-//   socket: {
-//     host: "localhost",
-//     port: 6379,
-//   },
-// });
-
 // Dedicated pub/sub clients
 const subscriber = new Redis(REDIS_URI);
 const publisher = new Redis(REDIS_URI);
@@ -70,6 +59,8 @@ connectToRedis();
 // Maps to track connections by room (in-memory for this server only)
 const connectionsByRoom = new Map<string, Set<WebSocket>>();
 const connectionToRoom = new Map<WebSocket, string>();
+const userIdsByRoom = new Map<string, Set<string>>();
+const connectionToUserId = new Map<WebSocket, string>();
 
 // Handle messages from Redis pub/sub
 function handleRedisMessage(channel: string, message: string) {
@@ -93,8 +84,28 @@ function handleRedisMessage(channel: string, message: string) {
       }
     });
     
+    // Update local user count if userJoined or userLeft event from another server
+    if (event === "userJoined" || event === "userLeft") {
+      updateLocalUserCount(roomId, data.userId, event === "userJoined");
+    }
+    
   } catch (error) {
     console.error("Error handling Redis message:", error);
+  }
+}
+
+// Update local tracking of users when receiving events from other servers
+function updateLocalUserCount(roomId: string, userId: string, isJoining: boolean) {
+  if (!userIdsByRoom.has(roomId)) {
+    userIdsByRoom.set(roomId, new Set());
+  }
+  
+  const roomUsers = userIdsByRoom.get(roomId)!;
+  
+  if (isJoining) {
+    roomUsers.add(userId);
+  } else {
+    roomUsers.delete(userId);
   }
 }
 
@@ -156,6 +167,41 @@ async function cleanupRoom(roomId: string) {
   }
 }
 
+// Get total user count for a room across all server instances
+async function getRoomUserCount(roomId: string): Promise<number> {
+  try {
+    const onlineUsers = await redisClient.sMembers(`onlineUsers:${roomId}`);
+    return onlineUsers.length;
+  } catch (error) {
+    console.error(`Error getting user count for room ${roomId}:`, error);
+    return 0;
+  }
+}
+
+// Add user to room in Redis
+async function addUserToRoom(roomId: string, userId: string) {
+  try {
+    await redisClient.sAdd(`onlineUsers:${roomId}`, userId);
+    const count = await getRoomUserCount(roomId);
+    return count;
+  } catch (error) {
+    console.error(`Error adding user ${userId} to room ${roomId}:`, error);
+    return 0;
+  }
+}
+
+// Remove user from room in Redis
+async function removeUserFromRoom(roomId: string, userId: string) {
+  try {
+    await redisClient.sRem(`onlineUsers:${roomId}`, userId);
+    const count = await getRoomUserCount(roomId);
+    return count;
+  } catch (error) {
+    console.error(`Error removing user ${userId} from room ${roomId}:`, error);
+    return 0;
+  }
+}
+
 // Handle a new connection joining a room
 async function handleJoinRoom(ws: WebSocket, roomId: string, userId: string) {
   try {
@@ -169,10 +215,28 @@ async function handleJoinRoom(ws: WebSocket, roomId: string, userId: string) {
     connectionsByRoom.get(roomId)?.add(ws);
     connectionToRoom.set(ws, roomId);
     
-    console.log(`User joined room: ${userId} && ${roomId} (server: ${SERVER_ID})`);
+    // Track user ID
+    connectionToUserId.set(ws, userId);
+    
+    // Add user to room's user set
+    if (!userIdsByRoom.has(roomId)) {
+      userIdsByRoom.set(roomId, new Set());
+    }
+    userIdsByRoom.get(roomId)?.add(userId);
+    
+    // Add user to room in Redis and get updated count
+    const userCount = await addUserToRoom(roomId, userId);
+    
+    console.log(`User joined room: ${userId} in ${roomId} (server: ${SERVER_ID}), total users: ${userCount}`);
     
     // Send room state to the new connection
     await sendRoomState(ws, roomId, userId);
+    
+    // Broadcast user joined event with updated count to all users in the room
+    await broadcastToRoom(roomId, "userJoined", { 
+      userId, 
+      userCount
+    });
     
   } catch (error) {
     console.error(`Error handling join for room ${roomId}:`, error);
@@ -186,6 +250,13 @@ async function handleJoinRoom(ws: WebSocket, roomId: string, userId: string) {
 // Send the current room state to a connection
 async function sendRoomState(ws: WebSocket, roomId: string, userId: string) {
   try {
+    // Get user count
+    const userCount = await getRoomUserCount(roomId);
+    ws.send(JSON.stringify({ 
+      type: "userCount", 
+      count: userCount 
+    }));
+    
     // Get chat status
     const chatStatus = await redisClient.get(`chatStatus:${roomId}`);
     ws.send(JSON.stringify({ 
@@ -247,7 +318,7 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(message.toString());
       const roomId = data.roomId || connectionToRoom.get(ws);
-      const userId = data.userId
+      const userId = data.userId || connectionToUserId.get(ws);
       
       if (!roomId && !userId && data.type !== "join") {
         console.error("No room ID for message:", data);
@@ -290,14 +361,6 @@ wss.on("connection", (ws) => {
         case "addSong":
           console.log("event happened for add song");
           console.log(data);
-          // const songAddStatus = await redisClient.get(`allowSongAdd:${roomId}`);
-          // if (songAddStatus === "paused") {
-          //   ws.send(JSON.stringify({ 
-          //     type: "songError", 
-          //     message: "Adding songs is currently disabled by the room admin"
-          //   }));
-          //   return;
-          // }
           
           // Add song to queue
           await redisClient.rPush(`queue:${roomId}`, JSON.stringify(data.song));
@@ -464,13 +527,16 @@ wss.on("connection", (ws) => {
   });
   
   // Handle WebSocket disconnection
-  ws.on("close", () => {
+  ws.on("close", async () => {
     const roomId = connectionToRoom.get(ws);
-    if (roomId) {
+    const userId = connectionToUserId.get(ws);
+    
+    if (roomId && userId) {
       // Remove connection from tracking
       connectionToRoom.delete(ws);
-      const roomConnections = connectionsByRoom.get(roomId);
+      connectionToUserId.delete(ws);
       
+      const roomConnections = connectionsByRoom.get(roomId);
       if (roomConnections) {
         roomConnections.delete(ws);
         
@@ -479,7 +545,30 @@ wss.on("connection", (ws) => {
         }
       }
       
-      console.log(`User left room: ${roomId} (server: ${SERVER_ID})`);
+      // Check if this is the last connection for this user in this room
+      let isLastConnectionForUser = true;
+      connectionsByRoom.get(roomId)?.forEach(conn => {
+        if (connectionToUserId.get(conn) === userId) {
+          isLastConnectionForUser = false;
+        }
+      });
+      
+      // If it's the last connection, remove the user from the room
+      if (isLastConnectionForUser) {
+        // Remove from local tracking
+        userIdsByRoom.get(roomId)?.delete(userId);
+        
+        // Remove from Redis and get updated count
+        const userCount = await removeUserFromRoom(roomId, userId);
+        
+        console.log(`User left room: ${userId} in ${roomId} (server: ${SERVER_ID}), remaining users: ${userCount}`);
+        
+        // Broadcast user left with updated count
+        await broadcastToRoom(roomId, "userLeft", {
+          userId,
+          userCount
+        });
+      }
     }
   });
 });
