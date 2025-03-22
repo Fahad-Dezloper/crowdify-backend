@@ -1,0 +1,11 @@
+    // const PORT = process.env.WS_PORT || 4000;
+// const server = http.createServer();
+// const wss = new WebSocketServer({ server });
+
+// // Redis configuration for Railway
+// const redisClient = redis.createClient({
+//   url: process.env.REDIS_URL || "redis://default:sWrKlxRDRDgnAToHfBHWSlzlwzoZVYFa@tramway.proxy.rlwy.net:15775"
+// });
+
+
+ngrok http 4000
