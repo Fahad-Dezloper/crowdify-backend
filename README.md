@@ -42,4 +42,13 @@ Run the following command to start a Redis container using Docker:
 docker run --name redis-container -p 6379:6379 -d redis
 ```
 
+### Step 5: Run PNPM
+Run the following commands to start the backend:
+```sh
+pnpm install
+```
+```sh
+pnpm run dev
+```
+
 Now, your backend should be properly configured and ready to run!
